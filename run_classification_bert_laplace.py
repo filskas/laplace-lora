@@ -83,7 +83,7 @@ def parse_args():
     parser.add_argument(
         "--task_name",
         type=str,
-        default='wnli',
+        default='rte',
         help="The name of the glue task to train on.",
         choices=list(task_to_keys.keys()),
     )
@@ -127,7 +127,7 @@ def parse_args():
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=8,
+        default=128,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -137,11 +137,10 @@ def parse_args():
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", type=int, default=10, help="Total number of training epochs to perform.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=10000,
         help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -194,6 +193,7 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
+    parser.add_argument("--wandb_tag", type=str, default=None, help="Wandb tag to use.")
     parser.add_argument(
         "--ignore_mismatched_sizes",
         action="store_true",
@@ -211,8 +211,9 @@ def parse_args():
     parser.add_argument("--laplace_optim_step", type=int, default=1000)
     parser.add_argument("--testing_set", type=str, default='val')
     parser.add_argument("--laplace_predict", type=str, default='mc_corr_100000', help='probit bridge bridge_norm mc_indep mc_corr')
-    args = parser.parse_args()
+    parser.add_argument("--laplace_prior_precision_multiplier", type=float, default=1.0, help='the prior precision multiplier')
 
+    args = parser.parse_args()
     print(args)
 
     peft_method = 'lora'
@@ -247,8 +248,9 @@ def main(load_step):
     send_example_telemetry("run_glue_no_trainer", args)
     
     peft_method = 'lora'
-    laplace_output_dir = f'/user/work/ad20999/outputs_laplace/{args.task_name}/{args.model_name_or_path}_{peft_method}_{args.lora_alpha}_{args.lora_dropout}_{args.learning_rate}_{args.seed}/step_{args.load_step}'
-    
+
+    laplace_output_dir = f"{os.getenv('SCRATCH')}/laplace-lora/outputs-laplace/{args.task_name}/{args.model_name_or_path}_{peft_method}_{args.lora_alpha}_{args.lora_dropout}_{args.learning_rate}_{args.seed}/step_{args.load_step}"
+
     os.makedirs(laplace_output_dir, exist_ok=True)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
@@ -293,6 +295,14 @@ def main(load_step):
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
+
+   
+    if args.with_tracking:
+        experiment_config = vars(args)
+        # TensorBoard cannot log Enums, need the raw value
+        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
+        accelerator.init_trackers("glue_no_trainer_laplace", experiment_config, init_kwargs={"wandb": {"tags": [args.wandb_tag]}})
+
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
@@ -358,12 +368,18 @@ def main(load_step):
 
     if args.laplace_sub == 'all':
         for name, param in model.named_parameters():
+            param.requires_grad = False
             if 'lora' in name:
                 param.requires_grad = True
-    else:    
+    elif args.laplace_sub == 'head':
         for name, param in model.named_parameters():
             param.requires_grad = False
             if 'out_proj' in name:
+                param.requires_grad = True
+    # old 'all' (the way it was implemented in the original code) - we think incorrectly/misleadingly
+    else:
+        for name, param in model.named_parameters():
+            if 'lora' in name:
                 param.requires_grad = True
 
 
@@ -466,7 +482,7 @@ def main(load_step):
         # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
         # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None))
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.mixed_precision != "no" else None))
 
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
@@ -520,6 +536,8 @@ def main(load_step):
     else:
         metric = evaluate.load("accuracy")
 
+    ece_metric = evaluate.load("jordyvl/ece")
+
     class WrappedModel(torch.nn.Module):
         def __init__(self, model):
             super().__init__()
@@ -539,7 +557,6 @@ def main(load_step):
         la = Laplace(model, 'classification', prior_precision=1.,
                         subset_of_weights='all',  #args.laplace_sub,
                         hessian_structure=args.laplace_hessian)
-        
 
     print('----fitting Laplace-----')
     la.fit(train_dataloader)
@@ -551,15 +568,22 @@ def main(load_step):
             prior_precision = la.optimize_prior_precision(method='marglik', n_steps=args.laplace_optim_step, lr=1e-1)
         elif args.testing_set != 'val':
             prior_precision = la.optimize_prior_precision(method='CV', val_loader=val_dataloader, log_prior_prec_min=-3, log_prior_prec_max=4, grid_size=100, lr=1e-1, n_steps=args.laplace_optim_step)
+
+
+        la.prior_precision *= args.laplace_prior_precision_multiplier
+        prior_precision = la.prior_precision
+
+
         print(f'prior precision: {prior_precision}')
         torch.save(prior_precision, f'{laplace_output_dir}/prior_precision_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}.pt')
 
-
+    print(f'marginal log likelihood: {la.log_marginal_likelihood()}')
     if args.save:
         with open(f'{laplace_output_dir}/la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}.pkl', 'wb') as f:
             dill.dump(la, f)
 
-    
+    marg_log_lik_before = la.log_marginal_likelihood()
+
     samples_seen = 0
     output_dicts = []
     f_mu_list = []
@@ -591,7 +615,7 @@ def main(load_step):
                 'probs': probs.cpu().numpy().tolist(),
             }
             output_dicts.append(output_dict)
-            
+
         predictions, references = accelerator.gather((predictions, batch["labels"]))
         # If we are in a multiprocess environment, the last batch has duplicates
         if accelerator.num_processes > 1:
@@ -604,6 +628,7 @@ def main(load_step):
             predictions=predictions,
             references=references,
         )
+        ece_metric.add_batch(references=references, predictions=logits)
 
     f_mu = torch.cat(f_mu_list, dim=0)
     f_var = torch.cat(f_var_list, dim=0)
@@ -624,9 +649,16 @@ def main(load_step):
             output_dict_str = json.dumps(output_dict)
             f.write(f'{output_dict_str}\n')
 
+    print(f"are log marg like the same after val? {marg_log_lik_before == la.log_marginal_likelihood()}")
+    print(f"marg log like after: {la.log_marginal_likelihood()}")
     eval_metric = metric.compute()
+    ece_eval_metric = ece_metric.compute()
 
     all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
+    ece_results = {f"eval_{k}": v for k, v in ece_eval_metric.items()}
+    marglik = {"marginal_log_likelihood": la.log_marginal_likelihood()}
+    if args.with_tracking:
+         accelerator.log({**all_results, **ece_results, **marglik}, step=args.load_step)
 
     all_results_path = os.path.join(output_dir, f"all_results_la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_predict}_{args.laplace_optim_step}.json")
 
@@ -634,13 +666,15 @@ def main(load_step):
     if os.path.isfile(all_results_path):
         os.remove(all_results_path)
 
-    
+
     # write to the all_results file
     with open(all_results_path, "w") as f:
         json.dump(all_results, f)
 
 
-    del model, train_dataloader, output_dicts, metric, la, f_mu, f_var, f_mu_list, f_var_list, eval_dataloader, val_dataloader
+    del model, train_dataloader, output_dicts, metric, la, f_mu, f_var, f_mu_list, f_var_list, eval_dataloader
+    if args.testing_set != 'val':
+        del val_dataloader
     
     torch.cuda.empty_cache()
 

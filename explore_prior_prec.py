@@ -42,8 +42,13 @@ from peft import (
     PeftType,
     PrefixTuningConfig,
     PromptEncoderConfig,
+    PeftModel,
+    PeftConfig
 )
 
+from laplace import Laplace
+import pickle
+import dill
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.31.0.dev0")
@@ -72,12 +77,13 @@ task_to_keys = {
 }
 
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser.add_argument(
         "--task_name",
         type=str,
-        default='wnli',
+        default='rte',
         help="The name of the glue task to train on.",
         choices=list(task_to_keys.keys()),
     )
@@ -131,10 +137,11 @@ def parse_args():
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=10, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
+        default=10000,
         help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -154,7 +161,7 @@ def parse_args():
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument("--output_dir", type=str, default='/user/work/ad20999/outputs', help="Where to store the final model.")
-    parser.add_argument("--seed", type=int, default=0, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=21, help="A seed for reproducible training.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument(
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
@@ -187,17 +194,26 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
-    parser.add_argument("--wandb_tag", type=str, default=None, help="Wandb tag to use.")
     parser.add_argument(
         "--ignore_mismatched_sizes",
         action="store_true",
         default=True,
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
+    parser.add_argument("--save", action="store_true", default=False)
+    parser.add_argument("--load_step", type=int, default=0)
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
-    parser.add_argument("--testing_set", type=str, default='train_val')
+    parser.add_argument("--laplace_hessian", type=str, default='kron')
+    parser.add_argument("--laplace_sub", type=str, default='all')
+    parser.add_argument("--laplace_prior", type=str, default='homo', help='homo, hetero')
+    parser.add_argument("--laplace_optim_step", type=int, default=1000)
+    parser.add_argument("--testing_set", type=str, default='val')
+    parser.add_argument("--laplace_predict", type=str, default='mc_corr_100000', help='probit bridge bridge_norm mc_indep mc_corr')
+    parser.add_argument("--laplace_fixed_prior_precision", type=int, default=-1, help='the prior precision to use instead of optimizing it')
+    parser.add_argument("--num_laplace_fits", type=int, default=1,
+                        help='the number of fit/prior_optimization operations')
     args = parser.parse_args()
 
     print(args)
@@ -205,12 +221,9 @@ def parse_args():
     peft_method = 'lora'
     if args.testing_set != 'val':
         peft_method += args.testing_set
+
     args.output_dir += f'/{args.task_name}/{args.model_name_or_path}_{peft_method}_{args.lora_alpha}_{args.lora_dropout}_{args.learning_rate}_{args.seed}'
 
-    # if args.testing_set == 'test':
-    #     args.output_dir += f'/{args.task_name}_{args.testing_set}/{args.model_name_or_path}_lora_{args.lora_alpha}_{args.lora_dropout}_{args.learning_rate}_{args.seed}'
-    # else:
-    #     args.output_dir += f'/{args.task_name}/{args.model_name_or_path}_lora_{args.lora_alpha}_{args.lora_dropout}_{args.learning_rate}_{args.seed}'
 
     # Sanity checks
     if args.task_name is None and args.train_file is None and args.validation_file is None:
@@ -231,9 +244,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print("script started")
+    # args.load_step = load_step
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_glue_no_trainer", args)
+    
+    peft_method = 'lora'
+
+    laplace_output_dir = f"{os.getenv('SCRATCH')}/laplace-lora/outputs-laplace/{args.task_name}/{args.model_name_or_path}_{peft_method}_{args.lora_alpha}_{args.lora_dropout}_{args.learning_rate}_{args.seed}/step_{args.load_step}"
+
+    os.makedirs(laplace_output_dir, exist_ok=True)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -256,8 +277,8 @@ def main():
         transformers.utils.logging.set_verbosity_error()
 
     # If passed along, set the training seed now.
-    if args.seed is not None:
-        set_seed(args.seed)
+    # if args.seed is not None:
+    set_seed(args.seed)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -278,6 +299,14 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
+   
+    if args.with_tracking:
+        experiment_config = vars(args)
+        # TensorBoard cannot log Enums, need the raw value
+        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
+        accelerator.init_trackers("glue_no_trainer_laplace_prior_prec_exploration", experiment_config)
+
+
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
 
@@ -290,12 +319,10 @@ def main():
 
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if args.task_name is not None:
-        # Downloading and loading a dataset from the hub.
-        if args.task_name in ['wnli', 'rte', 'mrpc', 'cola', 'sst2', 'qnli', 'qqp', 'mnli']:
-            raw_datasets = load_dataset("glue", args.task_name)
-        elif args.task_name in ['cb', 'wic', 'boolq']:
-            raw_datasets = load_dataset("super_glue", args.task_name)
+    if args.task_name in ['wnli', 'rte', 'mrpc', 'cola', 'sst2', 'qnli', 'qqp', 'mnli']:
+        raw_datasets = load_dataset("glue", args.task_name)
+    elif args.task_name in ['cb', 'wic', 'boolq']:
+        raw_datasets = load_dataset("super_glue", args.task_name)
     else:
         # Loading the dataset from local csv or json file.
         data_files = {}
@@ -334,21 +361,27 @@ def main():
     # download model & vocab.
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name_or_path,
-        from_tf=bool(".ckpt" in args.model_name_or_path),
-        config=config,
-        ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-    )
 
-    peft_config = LoraConfig(task_type="SEQ_CLS", inference_mode=False, r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
-    model = get_peft_model(model, peft_config)
+    output_dir = args.output_dir + f'/step_{args.load_step}'
+
+    peft_config = PeftConfig.from_pretrained(output_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(peft_config.base_model_name_or_path, ignore_mismatched_sizes=True, num_labels=num_labels)
+    model = PeftModel.from_pretrained(model, output_dir)
     model.print_trainable_parameters()
 
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            # print(f'param name {name}, param shape {param.shape}, param mean {param.mean()}, param std {param.std()}')
-            print(f'param name {name}, param shape {param.shape} {param.dtype}')
+    if args.laplace_sub == 'all':
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            if 'lora' in name:
+                param.requires_grad = True
+    else:
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            if 'out_proj' in name:
+                param.requires_grad = True
+
+
+    model.print_trainable_parameters()
 
 
     # Preprocessing the datasets
@@ -405,7 +438,13 @@ def main():
         )
         result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
 
-        result["labels"] = examples["label"]
+        if "label" in examples:
+            if label_to_id is not None:
+                # Map labels to IDs (not necessary for GLUE tasks)
+                result["labels"] = [label_to_id[l] for l in examples["label"]]
+            else:
+                # In all cases, rename the column to labels because the model will expect that.
+                result["labels"] = examples["label"]
         return result
 
     with accelerator.main_process_first():
@@ -446,9 +485,9 @@ def main():
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
     if args.testing_set != 'val':
         val_dataloader = DataLoader(val_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -480,214 +519,168 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    if args.testing_set == 'val':
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-        )
-    elif args.testing_set != 'val':
-        model, optimizer, train_dataloader, eval_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, val_dataloader, lr_scheduler
-        )
+    model, optimizer, eval_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, eval_dataloader, eval_dataloader, lr_scheduler
+    )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # Figure out how many steps we should save the Accelerator states
-    checkpointing_steps = args.checkpointing_steps
-    if checkpointing_steps is not None and checkpointing_steps.isdigit():
-        checkpointing_steps = int(checkpointing_steps)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if args.with_tracking:
-        experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("glue_no_trainer", experiment_config, init_kwargs={"wandb": {"tags": [args.wandb_tag]}})
+    model.eval()
 
     # Get the metric function
     if args.task_name is not None:
         if args.task_name in ['wnli', 'rte', 'mrpc', 'cola', 'sst2', 'qnli', 'qqp', 'mnli']:
-            metric = evaluate.load("glue", args.task_name, experiment_id=f"{args.output_dir}")
+            metric = evaluate.load("glue", args.task_name, experiment_id=f"{laplace_output_dir}/la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}")
         elif args.task_name in ['cb', 'wic', 'boolq']:
-            metric = evaluate.load("super_glue", args.task_name, experiment_id=f"{args.output_dir}")
+            metric = evaluate.load("super_glue", args.task_name, experiment_id=f"{laplace_output_dir}/la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}")
     else:
         metric = evaluate.load("accuracy")
 
-    print('=========')
-    print(accelerator.device)
+    ece_metric = evaluate.load("jordyvl/ece")
 
-    # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    class WrappedModel(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    completed_steps = 0
-    starting_epoch = 0
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            accelerator.print(f"Resumed from checkpoint: {args.resume_from_checkpoint}")
-            accelerator.load_state(args.resume_from_checkpoint)
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
+        def forward(self, **kwargs):
+            output_dict = self.model(**kwargs)
+            return output_dict['logits']
 
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-            resume_step = None
-            completed_steps = starting_epoch * num_update_steps_per_epoch
-        else:
-            # need to multiply `gradient_accumulation_steps` to reflect real steps
-            resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
-            starting_epoch = resume_step // len(train_dataloader)
-            resume_step -= starting_epoch * len(train_dataloader)
-            completed_steps = resume_step // args.gradient_accumulation_step
+    model = WrappedModel(model)
+    
+    if args.laplace_prior == 'hetero':
+        la = Laplace(model, 'classification',
+                        subset_of_weights='all',  #args.laplace_sub,
+                        hessian_structure=args.laplace_hessian)
+    elif args.laplace_prior == 'homo':
+        la = Laplace(model, 'classification', prior_precision=1.,
+                        subset_of_weights='all',  #args.laplace_sub,
+                        hessian_structure=args.laplace_hessian)
 
-    test_loader_list = [eval_dataloader]
-    test_loader_names = ['eval']
+    for _ in range(args.num_laplace_fits):
+        print('----fitting Laplace-----')
+        la.fit(train_dataloader)
+
+        # if args.load_step == 9999:
+        if args.laplace_optim_step > 0:
+            if args.testing_set == 'val':
+                prior_precision = la.optimize_prior_precision(method='marglik', n_steps=args.laplace_optim_step,
+                                                              lr=1e-1)
+            elif args.testing_set != 'val':
+                prior_precision = la.optimize_prior_precision(method='CV', val_loader=val_dataloader,
+                                                              log_prior_prec_min=-3, log_prior_prec_max=4,
+                                                              grid_size=100, lr=1e-1, n_steps=args.laplace_optim_step)
+
+            if args.laplace_fixed_prior_precision != -1:
+                la.prior_precision = args.laplace_fixed_prior_precision
+                prior_precision = la.prior_precision
+
+            print(f'prior precision: {prior_precision}')
+            # torch.save(prior_precision, f'{laplace_output_dir}/prior_precision_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}.pt')
+
+        # if args.save:
+        #     with open(f'{laplace_output_dir}/la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}.pkl', 'wb') as f:
+        #         dill.dump(la, f)
+
+        samples_seen = 0
+        output_dicts = []
+        f_mu_list = []
+        f_var_list = []
+        for step, batch in enumerate(eval_dataloader):
+            with torch.no_grad():
+                # logits = la(batch)
+                f_mu, f_var = la._glm_predictive_distribution(batch)
+                f_mu_list.append(f_mu)
+                f_var_list.append(f_var)
+
+            samples = int(args.laplace_predict.split('_')[-1])
+            f_mu = f_mu.expand(samples, -1, -1)
+            f_var = f_var.expand(samples, -1, -1, -1)
+            logits = torch.softmax(f_mu + (
+                        torch.linalg.cholesky(f_var).to(f_mu.dtype) @ torch.randn_like(f_mu).unsqueeze(-1).to(
+                    f_mu.dtype).to(accelerator.device)).squeeze(-1), dim=-1).mean(0)
+
+            predictions = logits.argmax(dim=-1)
+
+            logits = logits.detach()
+            for j in range(logits.size(0)):
+                probs = logits[j]  # F.softmax(logits[j], -1)
+                label = batch["labels"]
+                output_dict = {
+                    'index': args.per_device_train_batch_size * step + j,
+                    'true': label[j].item(),
+                    'pred': logits[j].argmax().item(),
+                    'conf': probs.max().item(),
+                    'logits': logits[j].cpu().numpy().tolist(),
+                    'probs': probs.cpu().numpy().tolist(),
+                }
+                output_dicts.append(output_dict)
+
+            predictions, references = accelerator.gather((predictions, batch["labels"]))
+            # If we are in a multiprocess environment, the last batch has duplicates
+            if accelerator.num_processes > 1:
+                if step == len(eval_dataloader) - 1:
+                    predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
+                    references = references[: len(eval_dataloader.dataset) - samples_seen]
+                else:
+                    samples_seen += references.shape[0]
+            metric.add_batch(
+                predictions=predictions,
+                references=references,
+            )
+            ece_metric.add_batch(references=references, predictions=logits)
+
+        f_mu = torch.cat(f_mu_list, dim=0)
+        f_var = torch.cat(f_var_list, dim=0)
+        # torch.save(f_mu,
+        #            f'{laplace_output_dir}/f_mu_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}.pt')
+        # torch.save(f_var,
+        #            f'{laplace_output_dir}/f_var_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_optim_step}.pt')
+
+        output_path = os.path.join(output_dir,
+                                   f'eval_res_la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_predict}_{args.laplace_optim_step}.json')
+        # output_path = os.path.join(output_dir, f'eval_res_la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}.json')
+        print(f'writing outputs to \'{output_path}\'')
+
+        # delete the file if it exists
+        if os.path.isfile(output_path):
+            os.remove(output_path)
+
+        with open(output_path, 'w+') as f:
+            for i, output_dict in enumerate(output_dicts):
+                output_dict_str = json.dumps(output_dict)
+                f.write(f'{output_dict_str}\n')
+
+        eval_metric = metric.compute()
+        ece_eval_metric = ece_metric.compute()
+
+        all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
+        ece_results = {f"eval_ece_{k}": v for k, v in ece_eval_metric.items()}
+        if args.with_tracking:
+            accelerator.log(all_results)
+            accelerator.log(ece_results)
+            # print(f"type(la.prior_mean) = {type(la.prior_mean)}")
+            # print(f"type(la.mean) = {type(la.mean)}")
+            # print(f"shape(la.prior_mean) = {la.prior_mean.shape}")
+            # print(f"shape(la.mean) = {la.mean.shape}")
+            accelerator.log({"prior_prec": prior_precision})
+
+        all_results_path = os.path.join(output_dir,
+                                        f"all_results_la_{args.laplace_hessian}_{args.laplace_sub}_{args.laplace_prior}_{args.laplace_predict}_{args.laplace_optim_step}.json")
+
+        # delete the all_results file if it exists
+        if os.path.isfile(all_results_path):
+            os.remove(all_results_path)
+
+        # write to the all_results file
+        with open(all_results_path, "w") as f:
+            json.dump(all_results, f)
+
+
+    del model, train_dataloader, output_dicts, metric, la, f_mu, f_var, f_mu_list, f_var_list, eval_dataloader
     if args.testing_set != 'val':
-        test_loader_list.append(val_dataloader)
-        test_loader_names.append('val')
-        
-    # update the progress_bar if load from checkpoint
-    progress_bar.update(completed_steps)
-    for epoch in range(starting_epoch, args.num_train_epochs):
-        active_dataloader = train_dataloader
-        total_loss = torch.tensor(0.0, dtype=torch.float, device=model.device)
-        for step, train_batch in enumerate(active_dataloader):
-
-            if isinstance(checkpointing_steps, int):
-                if (completed_steps+1) % checkpointing_steps == 0 or completed_steps == 0:
-                    for test_loader, test_loader_name in zip(test_loader_list, test_loader_names):
-
-                        if args.task_name is not None:
-                            if args.task_name in ['wnli', 'rte', 'mrpc', 'cola', 'sst2', 'qnli', 'qqp', 'mnli']:
-                                metric = evaluate.load("glue", args.task_name, experiment_id=f"{args.output_dir}_step_{completed_steps }_{test_loader_name}")
-                            elif args.task_name in ['cb', 'wic', 'boolq']:
-                                metric = evaluate.load("super_glue", args.task_name, experiment_id=f"{args.output_dir}_step_{completed_steps }_{test_loader_name}")
-                        else:
-                            metric = evaluate.load("accuracy")
-
-
-                        output_dir = f"step_{completed_steps}"
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(args.output_dir, output_dir)
-                        # accelerator.save_state(output_dir)
-
-                        model.eval()
-                        samples_seen = 0
-                        output_dicts = []
-                        for step, batch in enumerate(test_loader):
-                            with torch.no_grad():
-                                outputs = model(**batch)
-                            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-
-                            logits = logits = outputs.logits.detach()
-                            for j in range(logits.size(0)):
-                                probs = logits[j]  #F.softmax(logits[j], -1)
-                                label = batch["labels"]
-                                output_dict = {
-                                    'index': args.per_device_train_batch_size * step + j,
-                                    'true': label[j].item(),
-                                    'pred': logits[j].argmax().item(),
-                                    'conf': probs.max().item(),
-                                    'logits': logits[j].cpu().numpy().tolist(),
-                                    'probs': probs.cpu().numpy().tolist(),
-                                }
-                                output_dicts.append(output_dict)
-
-                            predictions, references = accelerator.gather((predictions, batch["labels"]))
-                            # If we are in a multiprocess environment, the last batch has duplicates
-                            if accelerator.num_processes > 1:
-                                if step == len(eval_dataloader) - 1:
-                                    predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
-                                    references = references[: len(eval_dataloader.dataset) - samples_seen]
-                                else:
-                                    samples_seen += references.shape[0]
-                            metric.add_batch(
-                                predictions=predictions,
-                                references=references,
-                            )
-
-                        eval_metric = metric.compute()
-                        logger.info(f"epoch {epoch}: {eval_metric}")
-
-                        if test_loader_name == 'eval':
-                            accelerator.wait_for_everyone()
-                            unwrapped_model = accelerator.unwrap_model(model)
-                            unwrapped_model.save_pretrained(
-                                output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-                            )
-                            if accelerator.is_main_process:
-                                tokenizer.save_pretrained(output_dir)
- 
-                        all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
-                        if args.with_tracking:
-                            accelerator.log(all_results, step=epoch)
-
-                        if test_loader_name == 'eval':
-                            all_results_output_path = os.path.join(output_dir, f"all_results.json")
-                        elif test_loader_name == 'val':
-                            all_results_output_path = os.path.join(output_dir, f"all_results_val.json")
-
-                        if os.path.isfile(all_results_output_path):
-                            os.remove(all_results_output_path)
-
-                        with open(all_results_output_path, "w") as f:
-                            json.dump(all_results, f)
-
-                        if test_loader_name == 'eval':
-                            output_path = os.path.join(output_dir, f'eval_res.json')
-                        elif test_loader_name == 'val':
-                            output_path = os.path.join(output_dir, f'val_res.json')
-                        print(f'writing outputs to \'{output_path}\'')
-
-                        if os.path.isfile(output_path):
-                            os.remove(output_path)
-
-                        with open(output_path, 'w+') as f:
-                            for i, output_dict in enumerate(output_dicts):
-                                output_dict_str = json.dumps(output_dict)
-                                f.write(f'{output_dict_str}\n')
-            
-            if completed_steps > args.max_train_steps:
-                break
-
-            model.train()
-            outputs = model(**train_batch)
-            loss = outputs.loss
-            # We keep track of the loss at each epoch
-            if args.with_tracking:
-                total_loss += loss.detach().float()
-            loss = loss / args.gradient_accumulation_steps
-            print(loss)
-            if args.with_tracking:
-                accelerator.log({"train_loss": loss, "total_loss": total_loss}, step=epoch)
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
-                    
+        del val_dataloader
+    
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
