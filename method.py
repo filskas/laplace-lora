@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import numpy as np
 import torch
@@ -24,6 +25,8 @@ from transformers import DataCollatorWithPadding
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 import logging
+from functools import wraps
+import time
 
 
 task_to_keys = {
@@ -54,18 +57,34 @@ logging.basicConfig(
         level=logging.INFO,
     )
 
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f'Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds')
+        return result
+    return timeit_wrapper
+
+
+@timeit
 def weights_shapes(weights):
     return {n: p.shape for n, p in weights.items()}
 
 
+@timeit
 def weights_numel(weights):
     return sum(p.numel() for n, p in weights.items())
 
 
+@timeit
 def flatten_weights(weights):
     return torch.cat([p.contiguous().view(-1) for n, p in weights.items()])
 
 
+@timeit
 def unflatten_weights(flattened, weights_shapes):
     offset = 0
     new_weights = {}
@@ -75,7 +94,22 @@ def unflatten_weights(flattened, weights_shapes):
         offset += numel
     return new_weights
 
-def trace_hessian_hutchinson1(model, X, weights, num_estimates=100, default_eval=True, **hvp_kwargs):
+
+@timeit
+def hvp_call(fwd, weights, rademacher_vector, **hvp_kwargs):
+    return hvp(fwd, inputs=flatten_weights(weights), v=rademacher_vector, **hvp_kwargs)
+
+
+@timeit
+def dot_call(rademacher_vector, Hv):
+    return torch.dot(rademacher_vector, Hv)
+
+@timeit
+def randint_call(size, device):
+    return torch.randint(0, 2, torch.Size(size), device=device, dtype=torch.float32) * 2 - 1
+
+
+def trace_hessian_hutchinson1(model, X, weights, num_estimates=100, default_eval=True, seed=None, **hvp_kwargs):
     """
     Although this implementation accepts weights dictionary containing multiple parameters,
     it fails then to return the correct trace. Therefore, use it always with a single parameter,
@@ -89,30 +123,31 @@ def trace_hessian_hutchinson1(model, X, weights, num_estimates=100, default_eval
             print("WARNING! Your model is in training mode. Make sure it is what you want.")
 
     device = next(iter(weights.values())).device
-    print(device)
+    print(f"device = {device}")
     shapes, numel = weights_shapes(weights), weights_numel(weights)
 
     trace_estimate = 0.0
     for _ in range(num_estimates):
         # Sample from Rademacher
-        rademacher_vector = torch.randint(0, 2, torch.Size([numel]), device=device, dtype=torch.float32) * 2 - 1
+        if seed:
+            torch.manual_seed(seed)
+        rademacher_vector = randint_call([numel], device)
         # Compute the Hessian-vector product using hvp (Hessian-vector product)
         fwd = lambda w: functional_call(model,
                                         parameter_and_buffer_dicts=unflatten_weights(w, shapes),
                                         args=(),
                                         kwargs=X)
-        out, Hv = hvp(fwd, inputs=flatten_weights(weights), v=rademacher_vector, **hvp_kwargs) # first output is the output of model
-        # print(out)
+        _, Hv = hvp_call(fwd, weights, rademacher_vector, **hvp_kwargs) # first output is the output of model
         # Sum the product of the random vector and the Hessian-vector product
-        trace_estimate += torch.dot(rademacher_vector, Hv)
+        trace_estimate += dot_call(rademacher_vector, Hv)
     # Average the trace estimates
     trace_estimate /= num_estimates
 
     return trace_estimate
 
 
-def trace_hessian_hutchinson(model, X, weights, num_estimates=100, default_eval=True, **hvp_kwargs):
-    return sum(trace_hessian_hutchinson1(model, X, {n: p}, num_estimates=num_estimates, default_eval=default_eval)
+def trace_hessian_hutchinson(model, X, weights, num_estimates=100, default_eval=True, seed=None, **hvp_kwargs):
+    return sum(trace_hessian_hutchinson1(model, X, {n: p}, num_estimates=num_estimates, default_eval=default_eval, seed=seed)
                 for n, p in weights.items())
 
 
@@ -141,15 +176,17 @@ class OutputSelector(nn.Module):
         return f
 
 
-def sweep_trace(model2, X, weights2):
+def sweep_trace(model2, X, weights2, batch_name, accelerator, seed=None):
     trace_estimates = []
-    for num_estimates in [10, 50, 100, 200, 500, 1000]:
+    for num_estimates in [1000,]:
         print(f"estimating {num_estimates}")
-        trace_estimate = trace_hessian_hutchinson(model2, X, weights2, num_estimates=num_estimates, default_eval=True)
+        trace_estimate = trace_hessian_hutchinson(model2, X, weights2, num_estimates=num_estimates, default_eval=True, seed=seed)
+        accelerator.log({f"{batch_name} Trace Estimate": trace_estimate}, step=num_estimates)
         trace_estimates.append(trace_estimate)
 
     print(trace_estimates)
     return trace_estimates
+
 
 
 def parse_args():
@@ -169,8 +206,12 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of gradient accumulation steps.")
-    parser.add_argument("--batch_number", type=int,
-                        help="Which batch to choose to run the hessian estimation on.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed number")
+    parser.add_argument("--num_estimates", type=int,
+                        help="How many values to sample for the hessian estimation.")
+    parser.add_argument("--wandb_tag", type=str,
+                        help="Tag for wandb")
 
     return parser.parse_args()
 
@@ -189,7 +230,11 @@ if __name__ == "__main__":
     # gradient_accumulation_steps = 1
     args = parse_args()
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(log_with='wandb')
+
+    experiment_config = vars(args)
+    accelerator.init_trackers("hessian_method_exploration", experiment_config, init_kwargs={"wandb": {"tags": [args.wandb_tag]}})
+
 
     raw_datasets = load_dataset("glue", args.task_name)
     is_regression = args.task_name == "stsb"
@@ -311,25 +356,33 @@ if __name__ == "__main__":
     if args.testing_set != 'val':
         val_dataloader = DataLoader(val_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
-    last_lora_layer_name = list(model.state_dict().keys())[-2]
-    last_lora_layer_weights = model.state_dict()[last_lora_layer_name]
-    print(f"last_lora_shape = {last_lora_layer_weights.shape}")
+    model, eval_dataloader, eval_dataloader = accelerator.prepare(
+        model, eval_dataloader, eval_dataloader
+    )
 
-    i = 0
-    active_dataloader = train_dataloader
-    for step, train_batch in enumerate(active_dataloader):
-        i += 1
-        if i == args.batch_number:
-            X = train_batch
-            break
 
     model2 = OutputSelector(model, output_no=0, reduce=torch.mean)
-    weights = {last_lora_layer_name: last_lora_layer_weights}
-    weights2 = {"model." + n: p for n, p in weights.items()}  # the original model is wrapped as model2.model
+    active_dataloader = train_dataloader
+    layer_names = list(model.state_dict().keys())
 
-    for seed in [1, 2, 3]:
-        trace_estimates = sweep_trace(model2, X, weights2)
-        arrays = [t.numpy() for t in trace_estimates]
-        # Save as a compressed file
-        np.savez(f"one-batch-task_{args.task_name}-bs_{args.per_device_train_batch_size}-bn_{args.batch_number}-seed_{seed}.npz", *arrays)
+    device = accelerator.device
+    model2.to(device)
+    model_state_dict = model.state_dict()
 
+    results = {}
+    for step, train_batch in enumerate(active_dataloader):
+        batch = {k: v.to(device) for k, v in train_batch.items()}
+        results[step] = {}
+        for idx, layer in enumerate(layer_names):
+            lora_layer_weights = model_state_dict[layer]
+            weights = {layer: lora_layer_weights}
+            weights2 = {"model." + n: p for n, p in weights.items()}  # the original model is wrapped as model2.model
+            trace_estimate = trace_hessian_hutchinson(model2, batch, weights2, num_estimates=args.num_estimates,
+                                                      default_eval=True, seed=args.seed)
+            accelerator.log({f"batch {step}, layer {layer} ({idx}) Trace Estimate": trace_estimate}, step=args.num_estimates)
+            # # Save as a compressed file
+            results[step][f"{layer}-idx"] = trace_estimate.item()
+            # np.savez(f"task_{args.task_name}-bs_{args.per_device_train_batch_size}-bn_{step}-lln_{layer}-lli_{idx}.npz", *arrays)
+
+    with open(f'task_{args.task_name}-bs_{args.per_device_train_batch_size}-num_estimates_{args.num_estimates}-seed_{args.seed}.json', 'w') as f:
+        json.dump(results, f, indent=4)
