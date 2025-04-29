@@ -135,6 +135,7 @@ def parse_args():
     parser.add_argument(
         "--max_train_steps",
         type=int,
+        default=10000,
         help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -345,6 +346,15 @@ def main():
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
+    # Freeze all parameters
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+
+    # Unfreeze only classifier head
+    for name, param in model.named_parameters():
+        if name.startswith('base_model.model.classifier.modules_to_save.default.out_proj.weight'):
+            param.requires_grad = True
+
     for name, param in model.named_parameters():
         if param.requires_grad:
             # print(f'param name {name}, param shape {param.shape}, param mean {param.mean()}, param std {param.std()}')
@@ -446,6 +456,10 @@ def main():
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
+    train_eval_dataloader = DataLoader(
+        train_dataset, shuffle=False, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+    )
+
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
     if args.testing_set != 'val':
         val_dataloader = DataLoader(val_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
@@ -455,11 +469,11 @@ def main():
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
@@ -481,12 +495,12 @@ def main():
 
     # Prepare everything with our `accelerator`.
     if args.testing_set == 'val':
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+        model, optimizer, train_dataloader, train_eval_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, train_eval_dataloader, eval_dataloader, lr_scheduler
         )
     elif args.testing_set != 'val':
-        model, optimizer, train_dataloader, eval_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, val_dataloader, lr_scheduler
+        model, optimizer, train_dataloader, train_eval_dataloader, eval_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, train_eval_dataloader, eval_dataloader, val_dataloader, lr_scheduler
         )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed
@@ -599,7 +613,7 @@ def main():
                                 outputs = model(**batch)
                             predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
 
-                            logits = logits = outputs.logits.detach()
+                            logits = outputs.logits.detach()
                             for j in range(logits.size(0)):
                                 probs = logits[j]  #F.softmax(logits[j], -1)
                                 label = batch["labels"]
@@ -658,6 +672,44 @@ def main():
                         elif test_loader_name == 'val':
                             output_path = os.path.join(output_dir, f'val_res.json')
                         print(f'writing outputs to \'{output_path}\'')
+
+                        if os.path.isfile(output_path):
+                            os.remove(output_path)
+
+                        with open(output_path, 'w+') as f:
+                            for i, output_dict in enumerate(output_dicts):
+                                output_dict_str = json.dumps(output_dict)
+                                f.write(f'{output_dict_str}\n')
+
+                        train_loader_name = 'train'
+                        output_dicts = []
+                        for step, batch in enumerate(train_eval_dataloader):
+                            with torch.no_grad():
+                                outputs = model(**batch)
+                            predictions = outputs.logits.argmax(
+                                dim=-1) if not is_regression else outputs.logits.squeeze()
+
+                            logits = outputs.logits.detach()
+                            for j in range(logits.size(0)):
+                                probs = logits[j]
+                                label = batch["labels"]
+                                output_dict = {
+                                    'index': args.per_device_train_batch_size * step + j,
+                                    'true': label[j].item(),
+                                    'pred': logits[j].argmax().item(),
+                                    'conf': probs.max().item(),
+                                    'logits': logits[j].cpu().numpy().tolist(),
+                                    'probs': probs.cpu().numpy().tolist(),
+                                }
+                                output_dicts.append(output_dict)
+
+                        # Save outputs to file
+                        output_dir = f"step_{completed_steps}"
+                        if args.output_dir is not None:
+                            output_dir = os.path.join(args.output_dir, output_dir)
+
+                        output_path = os.path.join(output_dir, f'{train_loader_name}_res.json')
+                        print(f'writing train outputs to \'{output_path}\'')
 
                         if os.path.isfile(output_path):
                             os.remove(output_path)
