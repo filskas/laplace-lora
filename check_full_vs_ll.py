@@ -11,6 +11,7 @@ from pathlib import Path
 import datasets
 import evaluate
 import torch
+import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
@@ -70,6 +71,18 @@ task_to_keys = {
     "wic": ("sentence1", "sentence2"),  # 6,000
     "boolq": ("passage", "question"),   # 9,427
 }
+
+
+class MyClassificationHead(nn.Module):
+    def __init__(self, hidden_size, num_labels):
+        super().__init__()
+        self.out_proj = nn.Linear(hidden_size, num_labels)
+
+    def forward(self, features, **kwargs):
+        x = features[:, 0, :]  # Take <s> token (equivalent to [CLS] for Roberta)
+        x = self.out_proj(x)
+        return x
+
 
 
 def parse_args():
@@ -449,13 +462,15 @@ def main():
     # model = get_peft_model(model, peft_config)
     #model.print_trainable_parameters()
 
+    model.classifier = MyClassificationHead(hidden_size=768, num_labels=num_labels)
+
     # Freeze all parameters
     for name, param in model.named_parameters():
         param.requires_grad = False
 
-    # Unfreeze only classifier head
+    # # Unfreeze only classifier head
     for name, param in model.named_parameters():
-        if "classifier.out_proj" in name:
+        if "classifier" in name:
             param.requires_grad = True
 
     for name, param in model.named_parameters():
